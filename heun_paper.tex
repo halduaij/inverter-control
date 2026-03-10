@@ -1,0 +1,407 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{booktabs}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{url}
+\usepackage{hyperref}
+\usepackage{setspace}
+\onehalfspacing
+
+\title{An Optimized Adaptive Heun Integrator for Differentiable\\
+       Simulation of Stiff Power Electronic Systems}
+
+\author{Hamad Alduaij\\
+School of Electrical, Computer and Energy Engineering\\
+Arizona State University, Tempe, AZ\\
+\texttt{halduaij@asu.edu}}
+
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Differentiable ODE solvers are central to gradient-based training of
+neural controllers for power electronic systems.  We identify a
+first-same-as-last (FSAL) implementation error in the widely used
+\texttt{torchdiffeq} adaptive Heun solver that evaluates the first
+stage at an incorrect point, inflating the error constant by
+2--3$\times$.  We provide a corrected and optimized implementation
+with JIT-compiled step logic, branchless adaptive step-size control,
+gradient separation, and Horner-form dense output.  On an 18-state
+system with stiff phase-locked-loop dynamics, the optimized solver
+achieves a 2.1$\times$ wall-clock speedup over the original
+\texttt{torchdiffeq} implementation while producing 2--3$\times$
+smaller errors at the same step size.  The code is open-source at
+\url{https://github.com/halduaij/inverter-control}.
+\end{abstract}
+
+% ============================================================================
+\section{Introduction}
+\label{sec:intro}
+% ============================================================================
+
+Gradient-based optimization of neural controllers for power systems
+requires differentiable time-domain simulation.  The controller
+parameters appear inside the ODE right-hand side $f(t, y; \theta)$, and
+training proceeds by backpropagating a trajectory-level loss through the
+ODE integrator to obtain $\partial \mathcal{L}/\partial\theta$.
+Libraries such as \texttt{torchdiffeq}~\cite{Chen18NeuralODE} provide
+adaptive-step ODE solvers within the PyTorch autograd framework and have
+become standard infrastructure for neural ODE training.
+
+Power electronic systems, however, present a specific numerical
+challenge: the coexistence of fast inner control loops (phase-locked
+loops with bandwidth $\sim$900~rad/s, current controllers at
+$\sim$1~kHz) and slow electromechanical dynamics (governor response at
+$\sim$0.1--1~Hz).  This moderate stiffness makes explicit methods
+viable---unlike the deeply stiff chemical kinetics problems that mandate
+implicit solvers---but demands that the explicit method be both correct
+and efficient.  The generic Runge--Kutta infrastructure in
+\texttt{torchdiffeq} introduces per-step overhead (Butcher tableau
+iteration, Python-level branching for step control, redundant tensor
+allocation) that compounds over the thousands of steps needed for
+moderately stiff simulations.
+
+In this note we report two findings regarding \texttt{torchdiffeq}'s
+adaptive Heun solver.  First, we identify a FSAL (first-same-as-last)
+implementation error that evaluates $k_1$ at the wrong point, inflating
+the per-step error constant by a factor of 2--3$\times$ while preserving
+second-order convergence.  Second, and more significant in practice, we
+provide an optimized standalone implementation that eliminates the
+generic RK overhead through JIT-compiled step arithmetic, branchless
+adaptive control, and gradient separation.
+
+The contributions are:
+\begin{enumerate}
+\item Identification and correction of the FSAL evaluation-point error
+      in the \texttt{torchdiffeq} Heun solver (Section~\ref{sec:bug}).
+\item A JIT-compiled adaptive Heun solver with branchless step-size
+      control, gradient separation, and Horner-form dense output that
+      achieves 2.1$\times$ wall-clock speedup over \texttt{torchdiffeq}
+      (Section~\ref{sec:impl}).
+\item Validation on an 18-state system with stiff PLL dynamics
+      (Section~\ref{sec:results}).
+\end{enumerate}
+
+% ============================================================================
+\section{Background: Adaptive Heun Method}
+\label{sec:background}
+% ============================================================================
+
+Heun's method is the simplest second-order explicit Runge--Kutta scheme.
+Given an ODE $\dot{y} = f(t, y)$, one step from $(t_n, y_n)$ with
+step size $h$ proceeds as:
+\begin{align}
+  k_1 &= f(t_n,\; y_n), \label{eq:k1} \\
+  k_2 &= f(t_n + h,\; y_n + h\,k_1), \label{eq:k2} \\
+  y_{n+1} &= y_n + \tfrac{h}{2}(k_1 + k_2). \label{eq:heun}
+\end{align}
+The Butcher tableau is
+\[
+\begin{array}{c|cc}
+0 & 0 & 0 \\
+1 & 1 & 0 \\
+\hline
+  & \tfrac12 & \tfrac12
+\end{array}
+\]
+with the embedded first-order (Euler) method $\hat{y}_{n+1} = y_n + h\,k_1$
+providing a local error estimate
+\begin{equation}
+  e_{n+1} = y_{n+1} - \hat{y}_{n+1} = \tfrac{h}{2}(k_2 - k_1).
+  \label{eq:err}
+\end{equation}
+
+\subsection{FSAL Property}
+
+For some Runge--Kutta methods (e.g., Dormand--Prince), the last stage
+evaluation $k_s$ is computed at the accepted solution $y_{n+1}$, so it
+can be reused as $k_1$ for the next step.  This ``first same as last''
+(FSAL) property saves one function evaluation per accepted step.
+
+For Heun's method, $k_2$ is evaluated at the Euler predictor
+$\tilde{y} = y_n + h\,k_1$, which differs from the accepted solution
+$y_{n+1}$ by $O(h^2)$.  Reusing $k_2$ as $k_1$ for the next step
+therefore evaluates the first stage at the wrong point, introducing an
+$O(h^2)$ per-step error in $k_1$.  Since $k_1$ is multiplied by $h$ in
+the update formula, this contributes an $O(h^3)$ local truncation error
+per step---the same order as Heun's inherent truncation error---so the
+global convergence order remains 2.  However, the additional error
+increases the leading error constant by a factor of 2--3$\times$,
+producing less accurate solutions at the same step size.
+
+% ============================================================================
+\section{The FSAL Bug in torchdiffeq}
+\label{sec:bug}
+% ============================================================================
+
+The \texttt{torchdiffeq} library implements adaptive Heun as a subclass
+of its generic adaptive-step Runge--Kutta solver.  The generic solver
+assumes the FSAL property holds and caches the last stage evaluation for
+reuse.  For methods where FSAL is valid (Dormand--Prince 4/5), this is
+correct.  For Heun's method, however, the cached $k_2$ was evaluated
+at $\tilde{y} = y_n + h\,k_1$, not at $y_{n+1}$.  Reusing it as
+$k_1$ for the next step means
+\begin{equation}
+  k_1^{(n+1)} = f(t_{n+1},\; \tilde{y}_n) \neq f(t_{n+1},\; y_{n+1}),
+  \label{eq:fsal_bug}
+\end{equation}
+where $\tilde{y}_n - y_{n+1} = \tfrac{h}{2}(k_1 - k_2) = O(h^2)$.
+This shifts the evaluation point of $k_1$ by a second-order amount
+at each step.  While this does not degrade the convergence order
+(both versions remain second-order), it inflates the error constant,
+producing 2--3$\times$ larger errors at any given step size
+(Table~\ref{tab:order}).  The corrupted $k_1$ also affects the error
+estimator~\eqref{eq:err}, which uses $k_1$ in the difference
+$k_2 - k_1$, potentially reducing the reliability of adaptive step-size
+selection.
+
+The fix is straightforward: evaluate $k_1 = f(t_{n+1}, y_{n+1})$ fresh
+at each step, at the cost of one additional function evaluation per
+step (2 evaluations total, matching the theoretical cost of a
+two-stage method).
+
+% ============================================================================
+\section{Implementation}
+\label{sec:impl}
+% ============================================================================
+
+Beyond the FSAL correction, we provide a standalone adaptive Heun solver
+that replaces the generic Runge--Kutta infrastructure with specialized
+routines.  The \texttt{torchdiffeq} generic solver iterates over the
+Butcher tableau, allocates intermediate $k$-tensors, and uses
+Python-level branching for step acceptance---all unnecessary overhead for
+a two-stage method.  The following optimizations eliminate this overhead.
+
+\subsection{JIT-Compiled Step Logic}
+
+All arithmetic in the step function---Euler prediction, Heun correction,
+error estimation, and step-size update---is decorated with
+\texttt{@torch.jit.script}, eliminating Python interpreter overhead for
+the inner loop.  The Heun step is computed directly as
+$y_1 = y_0 + \tfrac{h}{2}(k_1 + k_2)$ without iterating over a
+Butcher tableau.  Optionally, the entire step can be wrapped with
+\texttt{torch.compile} (PyTorch 2.0+) for further kernel fusion.
+
+\subsection{Branchless Step-Size Control}
+
+The step-size update uses \texttt{torch.where} throughout to avoid
+Python-level branching that would cause CPU--GPU synchronization:
+\begin{equation}
+  h_{n+1} = h_n \cdot \text{clamp}\!\bigl(
+    \sigma \cdot r_n^{-1/p},\; d_{\min},\; d_{\max}
+  \bigr),
+  \label{eq:step_ctrl}
+\end{equation}
+where $r_n = \|e_{n+1}\|_{\text{RMS}} / \text{tol}$ is the normalized
+error ratio, $p = 2$ is the method order, $\sigma = 0.9$ is the safety
+factor, $d_{\min} = 0.2$, and $d_{\max} = 10$.  The tolerance is
+mixed absolute--relative:
+$\text{tol}_i = \text{atol} + \text{rtol} \cdot
+\max(|y_n^{(i)}|, |y_{n+1}^{(i)}|)$.
+
+A step is accepted if $r_n \le 1$ or $h_n$ is already at the minimum
+allowed step size.
+
+\subsection{Dense Output}
+
+For saving solutions at prescribed output times without restricting the
+adaptive step size, we fit a quartic Hermite interpolant through
+$y_n$, $y_{n+1}$, $y_{\text{mid}} = y_n + (h/2)\,k_1$, $k_1$, and
+$k_2$, evaluated via Horner's rule with \texttt{torch.addcmul} for
+fused multiply-add:
+\begin{equation}
+  y(\tau) = c_0 + \tau\bigl(c_1 + \tau(c_2 + \tau(c_3 + \tau\,c_4))\bigr),
+  \quad \tau = \frac{t - t_n}{h} \in [0, 1].
+  \label{eq:horner}
+\end{equation}
+
+\subsection{Gradient Separation}
+
+The accept/reject decision~\eqref{eq:step_ctrl} is non-differentiable.
+We run the control logic inside \texttt{torch.no\_grad()} for
+efficiency, then recompute the accepted solution $y_{n+1} = y_n +
+(h/2)(k_1 + k_2)$ outside the no-grad block so that gradients flow
+through the Heun formula to $f$ and ultimately to the controller
+parameters $\theta$.  Algorithm~\ref{alg:step} summarizes one adaptive
+step.
+
+\begin{algorithm}[t]
+\caption{Corrected Adaptive Heun Step}
+\label{alg:step}
+\begin{algorithmic}[1]
+\REQUIRE State $y_n$, time $t_n$, step size $h$, tolerances atol, rtol
+\STATE $k_1 \gets f(t_n, y_n)$ \COMMENT{Fresh evaluation (no FSAL reuse)}
+\STATE $\tilde{y} \gets y_n + h\,k_1$ \COMMENT{Euler predictor}
+\STATE $k_2 \gets f(t_n + h,\; \tilde{y})$
+\STATE \textbf{with} \texttt{no\_grad()}:
+\STATE \quad $y_1 \gets y_n + \tfrac{h}{2}(k_1 + k_2)$
+\STATE \quad $e \gets \tfrac{h}{2}(k_2 - k_1)$
+\STATE \quad $r \gets \text{RMS}(e\,/\,\text{tol})$
+\STATE \quad $h_{\text{next}} \gets h \cdot
+              \text{clamp}(0.9\,r^{-0.5},\; 0.2,\; 10)$
+\STATE \quad accept $\gets (r \le 1)$
+\STATE \textbf{end}
+\STATE $y_1^{\text{grad}} \gets y_n + \tfrac{h}{2}(k_1 + k_2)$
+       \COMMENT{With gradients}
+\RETURN $y_1^{\text{grad}}$, accept, $h_{\text{next}}$
+\end{algorithmic}
+\end{algorithm}
+
+% ============================================================================
+\section{Application: Multi-Converter Power System}
+\label{sec:application}
+% ============================================================================
+
+The target application is a multi-converter power system with
+distributed adaptive voltage-oriented control (dVOC).  Each converter
+has voltage and current PI control loops, phase estimation, and filter
+dynamics.  We benchmark on an 18-state system that captures the
+essential stiffness structure: six fast PLL states with eigenvalues
+near $-30 \pm 780j$~rad/s, six medium-speed filter states, and six
+slow power-sharing states at 1--10~rad/s, producing a stiffness ratio
+of $\sim$100--1000.
+
+This stiffness ratio is mild enough that explicit methods remain
+competitive with implicit solvers (which would require Jacobian
+factorization at each step), but severe enough that solver overhead
+matters---thousands of steps are needed for a 100~ms simulation at
+tight tolerances.  The per-step overhead of generic Runge--Kutta
+infrastructure (tableau iteration, tensor allocation, Python branching)
+accumulates to a measurable fraction of total wall-clock time.
+
+The solver is embedded in a differentiable training loop where neural
+network gain schedulers are optimized via backpropagation through the
+ODE trajectory.  Both solution accuracy and computational efficiency
+directly affect training: larger error constants produce noisier
+gradients, while per-step overhead limits the number of training
+iterations per hour.
+
+% ============================================================================
+\section{Numerical Results}
+\label{sec:results}
+% ============================================================================
+
+\subsection{Convergence Order and Error Constants}
+
+We verify the convergence order and error constants on three test
+problems with known solutions, integrated with fixed step sizes.
+Table~\ref{tab:order} reports results for $\dot{y} = -0.5\,y$,
+$y(0) = 1$, integrated to $t = 4$ (exact solution $y(4) = e^{-2}$).
+
+\begin{table}[t]
+\centering
+\caption{Global error vs.\ step size: original (FSAL reuse) vs.\
+corrected.  Both methods converge at order 2 ($\sim$4$\times$ error
+reduction per halving of $h$); the FSAL bug inflates the error constant
+by 2.2--2.5$\times$.}
+\label{tab:order}
+\small
+\begin{tabular}{rccc}
+\toprule
+$h$ & Original (FSAL) & Corrected & Error ratio \\
+\midrule
+0.400 & $4.7 \times 10^{-3}$ & $2.1 \times 10^{-3}$ & 2.2$\times$ \\
+0.200 & $1.2 \times 10^{-3}$ & $4.9 \times 10^{-4}$ & 2.4$\times$ \\
+0.100 & $2.9 \times 10^{-4}$ & $1.2 \times 10^{-4}$ & 2.4$\times$ \\
+0.050 & $7.1 \times 10^{-5}$ & $2.9 \times 10^{-5}$ & 2.5$\times$ \\
+0.025 & $1.8 \times 10^{-5}$ & $7.1 \times 10^{-6}$ & 2.5$\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Both versions exhibit the expected $\sim$4$\times$ error reduction when
+$h$ is halved, confirming second-order convergence.  The error ratio
+(FSAL to corrected) is consistently 2.2--2.5$\times$ across all step
+sizes, indicating that the FSAL bug inflates the leading error constant
+without changing the convergence order.  We observe similar ratios on
+nonlinear ($\dot{y} = -y^2$, ratio 2.9--3.0$\times$) and oscillatory
+($\ddot{y} + y = 0$, ratio 2.5$\times$) test problems.
+
+\subsection{Performance vs.\ torchdiffeq}
+
+Table~\ref{tab:perf} compares wall-clock time for the optimized solver
+against \texttt{torchdiffeq}'s adaptive Heun on the 18-state stiff
+system (100~ms integration, 50 output points, CPU).  The optimized
+solver achieves a consistent 2.1$\times$ speedup despite performing
+2 function evaluations per step (vs.\ 1 for the FSAL-reusing original).
+The speedup comes from eliminating generic RK overhead: specialized
+two-stage step logic replaces Butcher tableau iteration, JIT-compiled
+arithmetic removes Python interpreter overhead, and branchless step-size
+control avoids CPU--GPU synchronization points.
+
+\begin{table}[t]
+\centering
+\caption{Wall-clock time: \texttt{torchdiffeq} vs.\ optimized solver
+(18-state system, 100~ms integration, CPU).}
+\label{tab:perf}
+\small
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Solver} & \textbf{Time (ms)} & \textbf{Speedup} & \textbf{Steps} \\
+\midrule
+\texttt{torchdiffeq} (rtol=$10^{-4}$) & 755 & 1.0$\times$ & $\sim$4300 \\
+Optimized (rtol=$10^{-4}$)             & 350 & 2.2$\times$ & 4290 \\
+\midrule
+\texttt{torchdiffeq} (rtol=$10^{-6}$) & 7328 & 1.0$\times$ & $\sim$43{,}600 \\
+Optimized (rtol=$10^{-6}$)             & 3441 & 2.1$\times$ & 43{,}639 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Both solvers take approximately the same number of steps for a given
+tolerance, confirming that the speedup is due to reduced per-step
+overhead rather than algorithmic step count differences.
+
+% ============================================================================
+\section{Conclusion}
+\label{sec:conclusion}
+% ============================================================================
+
+We identified a FSAL implementation error in the \texttt{torchdiffeq}
+adaptive Heun solver that evaluates the first stage at the Euler
+predictor rather than the accepted solution, inflating the error
+constant by 2--3$\times$.  The corrected and optimized implementation,
+available at \url{https://github.com/halduaij/inverter-control},
+combines the FSAL fix with JIT-compiled step logic, branchless
+adaptive control, and gradient separation.  On an 18-state system
+with stiff PLL dynamics, the optimized solver achieves 2.1$\times$
+wall-clock speedup over \texttt{torchdiffeq} while producing more
+accurate solutions, directly improving both simulation throughput and
+gradient quality for neural controller training.
+
+% ============================================================================
+\bibliographystyle{IEEEtran}
+
+\begin{thebibliography}{1}
+
+\bibitem{Chen18NeuralODE}
+R.~T.~Q. Chen, Y.~Rubanova, J.~Bettencourt, and D.~Duvenaud,
+``Neural ordinary differential equations,'' in
+\textit{Advances in Neural Information Processing Systems (NeurIPS)},
+vol.~31, 2018.
+
+\bibitem{Paszke19PyTorch}
+A.~Paszke \textit{et al.},
+``{PyTorch}: An imperative style, high-performance deep learning library,'' in
+\textit{Advances in Neural Information Processing Systems (NeurIPS)},
+vol.~32, 2019, pp.~8024--8035.
+
+\bibitem{DormandPrince80}
+J.~R. Dormand and P.~J. Prince,
+``A family of embedded {Runge--Kutta} formulae,''
+\textit{J. Comput. Appl. Math.}, vol.~6, no.~1, pp.~19--26, 1980.
+
+\bibitem{HairerNorsettWanner93}
+E.~Hairer, S.~P. N{\o}rsett, and G.~Wanner,
+\textit{Solving Ordinary Differential Equations I: Nonstiff Problems},
+2nd~ed.\hspace{0.5em} Berlin: Springer, 1993.
+
+\end{thebibliography}
+
+\end{document}
